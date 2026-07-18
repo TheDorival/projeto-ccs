@@ -1,0 +1,297 @@
+CODIGO JUTULDARCY V1
+
+
+
+using JutulDarcy, Jutul, Statistics, CSV, DataFrames
+
+# ═══════════════════════════════════════════════
+# PARÂMETROS GEOMECÂNICOS (Mohr-Coulomb)
+# ═══════════════════════════════════════════════
+
+coesao_Pa   = 5.0e6    # Pa  — coesão da falha
+atrito_grau = 30.0     # °   — ângulo de atrito interno
+P_ini_ref   = 21.62e6  # Pa  — pressão inicial Campo Pilar
+
+# Pressão de reativação (critério simplificado)
+P_reativacao = P_ini_ref + coesao_Pa / tand(atrito_grau)
+
+println("═"^60)
+println(" CAMPO PILAR — ANÁLISE CCS COM MOHR-COULOMB")
+println("═"^60)
+println("P_inicial   : $(round(P_ini_ref/1e6,    digits=2)) MPa")
+println("P_reativação: $(round(P_reativacao/1e6, digits=2)) MPa")
+println("P_fratura   : $(round(0.0181*2207.7,    digits=2)) MPa")
+println("═"^60)
+
+# ═══════════════════════════════════════════════
+# FUNÇÃO: CONSTRUÇÃO DO DOMÍNIO
+# ═══════════════════════════════════════════════
+
+function build_domain(nx, ny, nz, Lx, Lz, prof_injecao,
+                      k_res_mD, k_selante_mD, k_FSASP_mD,
+                      k_falha_mD, phi_res, phi_selante,
+                      phi_FSASP, phi_falha, i_falha, w_falha)
+
+    g  = CartesianMesh((nx, ny, nz), (Lx, 1.0, Lz))
+    nc = nx * ny * nz
+    perm = zeros(nc)
+    poro = zeros(nc)
+
+    for k in 1:nz
+        for j in 1:ny
+            for i in 1:nx
+                idx = (k-1)*(nx*ny) + (j-1)*nx + i
+                if k <= 12
+                    perm[idx] = k_res_mD     * 1e-3 * si_unit(:darcy)
+                    poro[idx] = phi_res
+                elseif k <= 15
+                    perm[idx] = k_selante_mD * 1e-3 * si_unit(:darcy)
+                    poro[idx] = phi_selante
+                else
+                    perm[idx] = k_FSASP_mD   * 1e-3 * si_unit(:darcy)
+                    poro[idx] = phi_FSASP
+                end
+                if abs(i - i_falha) <= w_falha
+                    perm[idx] = k_falha_mD * 1e-3 * si_unit(:darcy)
+                    poro[idx] = phi_falha
+                end
+            end
+        end
+    end
+
+    return g, reservoir_domain(g,
+        permeability = perm,
+        porosity     = poro,
+        depth        = prof_injecao)
+end
+
+# ═══════════════════════════════════════════════
+# FUNÇÃO: RODAR UM CENÁRIO
+# ═══════════════════════════════════════════════
+
+function rodar_cenario(;
+        i_falha         = 20,
+        k_falha_mD      = 100.0,
+        P_injecao_fator = 1.10,
+        anos            = 30,
+        # geomecânica
+        coesao_Pa       = 5.0e6,
+        atrito_grau     = 30.0)
+
+    # Parâmetros fixos — Campo Pilar / Bacia SEAL
+    nx, ny, nz   = 30, 1, 20
+    Lx, Lz       = 3000.0, 200.0
+    prof_injecao = 2207.7
+    P_ini        = 21.62e6
+    P_fratura    = 0.0181 * prof_injecao * 1e6
+    P_reativ     = P_ini + coesao_Pa / tand(atrito_grau)
+    rho_agua, rho_CO2 = 1020.0, 650.0
+    mu_agua,  mu_CO2  = 0.5e-3, 0.04e-3
+    i_injetor    = 3
+
+    # Propriedades por zona
+    k_res_mD     = 26.0
+    k_selante_mD = 0.0001    # Amann-Hildenbrand 2013
+    k_FSASP_mD   = 100.0
+    phi_res      = 0.102
+    phi_selante  = 0.02
+    phi_FSASP    = 0.20
+    phi_falha    = 0.08
+
+    _, domain = build_domain(nx, ny, nz, Lx, Lz, prof_injecao,
+        k_res_mD, k_selante_mD, k_FSASP_mD,
+        k_falha_mD, phi_res, phi_selante,
+        phi_FSASP, phi_falha, i_falha, 1)
+
+    phases = (LiquidPhase(), VaporPhase())
+    sys    = ImmiscibleSystem(phases,
+                reference_densities=[rho_agua, rho_CO2])
+
+    Injetor  = setup_vertical_well(domain, i_injetor, 1,
+        name=:Injetor,  heel=1, toe=12)
+    Produtor = setup_vertical_well(domain, nx-2, 1,
+        name=:Produtor, heel=1, toe=12)
+
+    model, parameters = setup_reservoir_model(domain, sys,
+        wells=[Injetor, Produtor])
+
+    c = [1e-6, 1e-4] / si_unit(:bar)
+    replace_variables!(model,
+        PhaseMassDensities = ConstantCompressibilityDensities(
+            p_ref           = P_ini,
+            density_ref     = [rho_agua, rho_CO2],
+            compressibility = c),
+        PhaseRelativePermeability = BrooksCoreyRelativePermeabilities(
+            sys, [2.5, 3.5], [0.2, 0.05]),
+        PhaseViscosities = [mu_agua, mu_CO2]
+    )
+
+    state0 = setup_reservoir_state(model,
+        Pressure    = P_ini,
+        Saturations = [1.0, 0.0])
+
+    I_ctrl = InjectorControl(
+        BottomHolePressureTarget(P_ini * P_injecao_fator),
+        [0.0, 1.0], density=rho_CO2)
+    P_ctrl = ProducerControl(
+        BottomHolePressureTarget(P_ini * 0.95))
+
+    forces = setup_reservoir_forces(model,
+        control=Dict(:Injetor => I_ctrl, :Produtor => P_ctrl))
+
+    dt = fill(365.0 * si_unit(:day), anos)
+
+    wd, states, _ = simulate_reservoir(state0, model, dt,
+        parameters=parameters, forces=forces,
+        info_level=-1)
+
+    # Extrair campos finais
+    Sf      = states[end][:Saturations][2, :]
+    P_final = states[end][:Pressure]
+
+    # Saturação por zona
+    S_selante = maximum(Sf[nx*12+1 : nx*15])
+    S_FSASP   = maximum(Sf[nx*15+1 : end])
+    S_falha   = maximum([Sf[(k-1)*(nx*ny) + i_falha] for k in 1:nz])
+
+    # Pressão máxima na falha (só no reservatório, camadas 1-12)
+    idx_falha = [(k-1)*(nx*ny) + i_falha for k in 1:12]
+    P_falha   = maximum(P_final[idx_falha])
+
+    # Métricas de risco
+    margem_fratura  = (P_fratura - P_falha) / 1e6
+    margem_reativ   = (P_reativ  - P_falha) / 1e6
+    dist_m          = (i_falha - i_injetor) * (Lx/nx)
+
+    # Mohr-Coulomb: reativação se P_falha > P_reativ
+    reativacao = P_falha >= P_reativ
+
+    # Classificação de risco
+    risco = if S_FSASP > 1e-4
+        "ALTO"
+    elseif reativacao || S_falha > 0.01 || margem_fratura < 5.0
+        "MEDIO"
+    else
+        "BAIXO"
+    end
+
+    return (
+        dist_falha_m     = dist_m,
+        k_falha_mD       = k_falha_mD,
+        fator_pressao    = P_injecao_fator,
+        P_falha_MPa      = round(P_falha/1e6,     digits=3),
+        P_reativ_MPa     = round(P_reativ/1e6,    digits=3),
+        margem_fratura   = round(margem_fratura,  digits=3),
+        margem_reativ    = round(margem_reativ,   digits=3),
+        reativacao       = reativacao,
+        S_selante        = round(S_selante,       digits=6),
+        S_FSASP          = round(S_FSASP,         digits=6),
+        S_falha          = round(S_falha,         digits=4),
+        risco            = risco
+    )
+end
+
+# ═══════════════════════════════════════════════
+# ANÁLISE DE SENSIBILIDADE — 36 CENÁRIOS
+# ═══════════════════════════════════════════════
+
+dist_falhas  = [8, 14, 20]
+k_falhas     = [10.0, 100.0, 1000.0, 10000.0]
+fat_pressoes = [1.05, 1.10, 1.20]
+
+total = length(dist_falhas) * length(k_falhas) * length(fat_pressoes)
+println("\nRodando $total cenários...\n")
+
+resultados = []
+cnt = 0
+
+for i_f in dist_falhas
+    for k_f in k_falhas
+        for fp in fat_pressoes
+            global cnt += 1
+            print("Cenário $cnt/$total  ")
+            r = rodar_cenario(
+                i_falha         = i_f,
+                k_falha_mD      = k_f,
+                P_injecao_fator = fp,
+                anos            = 20,
+                coesao_Pa       = 5.0e6,
+                atrito_grau     = 30.0)
+            push!(resultados, r)
+            reativ_str = r.reativacao ? " ⚠️ REATIVAÇÃO" : ""
+            println("dist=$(r.dist_falha_m)m  k=$(k_f)mD  " *
+                    "fp=$(fp)  → $(r.risco)$reativ_str")
+        end
+    end
+end
+
+# ═══════════════════════════════════════════════
+# TABELA NO TERMINAL
+# ═══════════════════════════════════════════════
+
+println("\n" * "═"^110)
+println(" ANÁLISE DE SENSIBILIDADE — CAMPO PILAR CCS — BACIA SEAL")
+println(" Selante: k=0.0001 mD | Mohr-Coulomb: c=5MPa, φ=30°")
+println("═"^110)
+println(
+    rpad("Dist(m)",   8),
+    rpad("k_f(mD)",  10),
+    rpad("Fat_P",     7),
+    rpad("P_f(MPa)", 10),
+    rpad("P_r(MPa)", 10),
+    rpad("M_frat",    8),
+    rpad("M_reat",    8),
+    rpad("Reat?",     7),
+    rpad("S_sel",     9),
+    rpad("S_FSASP",   9),
+    rpad("S_falha",   9),
+    "Risco")
+println("─"^110)
+
+for r in resultados
+    println(
+        rpad(r.dist_falha_m,  8),
+        rpad(r.k_falha_mD,   10),
+        rpad(r.fator_pressao,  7),
+        rpad(r.P_falha_MPa,   10),
+        rpad(r.P_reativ_MPa,  10),
+        rpad(r.margem_fratura, 8),
+        rpad(r.margem_reativ,  8),
+        rpad(r.reativacao,     7),
+        rpad(r.S_selante,      9),
+        rpad(r.S_FSASP,        9),
+        rpad(r.S_falha,        9),
+        r.risco)
+end
+
+println("─"^110)
+n_alto  = count(r -> r.risco == "ALTO",  resultados)
+n_medio = count(r -> r.risco == "MEDIO", resultados)
+n_baixo = count(r -> r.risco == "BAIXO", resultados)
+n_reat  = count(r -> r.reativacao,       resultados)
+println("\nRESUMO: ALTO=$n_alto  MÉDIO=$n_medio  BAIXO=$n_baixo  " *
+        "REATIVAÇÕES=$n_reat de $total cenários")
+println("P_fratura  : $(round(0.0181*2207.7, digits=2)) MPa")
+println("P_reativação: $(round(P_reativacao/1e6, digits=2)) MPa")
+
+# ═══════════════════════════════════════════════
+# EXPORTAR CSV
+# ═══════════════════════════════════════════════
+
+df = DataFrame(
+    dist_falha_m   = [r.dist_falha_m   for r in resultados],
+    k_falha_mD     = [r.k_falha_mD     for r in resultados],
+    fator_pressao  = [r.fator_pressao  for r in resultados],
+    P_falha_MPa    = [r.P_falha_MPa    for r in resultados],
+    P_reativ_MPa   = [r.P_reativ_MPa   for r in resultados],
+    margem_fratura = [r.margem_fratura for r in resultados],
+    margem_reativ  = [r.margem_reativ  for r in resultados],
+    reativacao     = [r.reativacao     for r in resultados],
+    S_selante      = [r.S_selante      for r in resultados],
+    S_FSASP        = [r.S_FSASP        for r in resultados],
+    S_falha        = [r.S_falha        for r in resultados],
+    risco          = [r.risco          for r in resultados]
+)
+
+CSV.write("sensibilidade_campo_pilar.csv", df)
+println("\nTabela salva em: sensibilidade_campo_pilar.csv")
