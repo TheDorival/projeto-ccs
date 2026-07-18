@@ -89,4 +89,55 @@ if nrow(df_selo) > 0
         xlabel="Pc de entrada do capeador (MPa)",
         ylabel="S máx. no capeador intacto (log)",
         yscale=log10,
-        title="Contenção do capead
+        title="Contenção do capeador — varredura selo/FSASP")
+    marcadores = [:circle, :rect, :utriangle]
+    for (i,ks_) in enumerate(ksel)
+        ys = Float64[]
+        for pc in pcs
+            s = filter(r -> r.k_selante_mD == ks_ && r.pc_selante_MPa == pc, df_selo)
+            push!(ys, max(maximum(s.S_selante), 1e-7))  # piso p/ escala log
+        end
+        scatterlines!(ax4, pcs, ys, marker=marcadores[i], markersize=14,
+            label="k_selante = $(ks_) mD")
+    end
+    hlines!(ax4, [1e-3], color=:red, linestyle=:dash, label="limiar risco ALTO")
+    axislegend(ax4, position=:rt)
+    save(joinpath(@__DIR__, "contencao_capeador.png"), fig4)
+    display(fig4)
+end
+
+# ═══════════════════════════════════════════════
+# 5. EXPLORADOR INTERATIVO (lift único — corrige observers aninhados)
+# ═══════════════════════════════════════════════
+fig5 = Figure(size=(1000,600))
+sg = SliderGrid(fig5[1:2,1],
+    (label="Distância (m)",     range=dists,               startvalue=dists[end]),
+    (label="k_falha (mD)",      range=ks,                  startvalue=100),
+    (label="Fator de Pressão",  range=sort(unique(df_falha.fator_pressao)), startvalue=1.10),
+    tellwidth=false)
+
+ax_press = Axis(fig5[1,2], ylabel="Pressão na falha (MPa)",
+    xticks=(1:3, ["PESSIMISTA","CENTRAL","OTIMISTA"]))
+ax_sat   = Axis(fig5[2,2], ylabel="Saturação na falha",
+    xticks=(1:3, ["PESSIMISTA","CENTRAL","OTIMISTA"]))
+
+dados = lift(sg.sliders[1].value, sg.sliders[2].value, sg.sliders[3].value) do d, k, fp
+    sub = df_falha[(df_falha.dist_falha_m .== d) .& (df_falha.k_falha_mD .== k) .&
+                   (df_falha.fator_pressao .== fp), :]
+    ordem = Dict("PESSIMISTA"=>1, "CENTRAL"=>2, "OTIMISTA"=>3)
+    sort!(sub, :cenario_geomec, by = c -> ordem[c])
+    (P = sub.P_falha_MPa, S = sub.S_falha)
+end
+
+scatter!(ax_press, lift(d -> 1:length(d.P), dados), lift(d -> d.P, dados),
+    markersize=20, color=:blue)
+scatter!(ax_sat,   lift(d -> 1:length(d.S), dados), lift(d -> d.S, dados),
+    markersize=20, color=:red)
+ylims!(ax_press, minimum(df_falha.P_falha_MPa)-1, maximum(df_falha.P_falha_MPa)+1)
+ylims!(ax_sat, 0, 1)
+
+save(joinpath(@__DIR__, "explorador_cenarios.png"), fig5)
+display(fig5)
+
+println("✅ Gráficos gerados: heatmap_sfalha, barras_risco, dispersao_pressao_sat, " *
+        "contencao_capeador, explorador_cenarios (.png)")

@@ -33,8 +33,13 @@ Geomecânica com dois critérios em paralelo: Mohr-Coulomb simplificado (P_reati
 ## Como rodar
 
 ```bash
-# 1ª vez: instalar dependências
+# 1ª vez: instalar todas as dependências (Project.toml/Manifest.toml)
 julia --project=. -e "using Pkg; Pkg.instantiate()"
+
+# GLMakie (fora do Project.toml; necessário apenas para graficos_makie.jl)
+# No PowerShell use: julia --project=. -e 'using Pkg; Pkg.add(\"GLMakie\")'
+# ou no REPL: julia --project=.  →  tecla ]  →  add GLMakie
+julia --project=. -e 'using Pkg; Pkg.add("GLMakie")'
 
 # Sensibilidade CCS (valida a base; ~15 min na 1ª execução por precompilação)
 julia --project=. simulacao_teste1.jl
